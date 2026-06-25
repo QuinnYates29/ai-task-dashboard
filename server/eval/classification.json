@@ -1,0 +1,26 @@
+{
+  "_comment": "Hand-labeled inputs → expected project id. EDIT the expected values to match how you'd actually file these; they're seeded guesses. Run with `npm run eval`.",
+  "projects": [
+    { "id": "fathom", "name": "BIST / FATHOM", "tag": "#fathom" },
+    { "id": "m7", "name": "M7 Resetter", "tag": "#m7" },
+    { "id": "ollama", "name": "Ollama Multi-Agent", "tag": "#ollama" },
+    { "id": "personal", "name": "Personal", "tag": "#personal" }
+  ],
+  "cases": [
+    { "input": "validate rs485 loopback on the saman board", "expected": "fathom" },
+    { "input": "run a BIST sweep on the dock unit and log ECC status", "expected": "fathom" },
+    { "input": "capture the MCM register dump during self-test", "expected": "fathom" },
+    { "input": "check I2C3 bus enumeration on PSS/SAMAN", "expected": "fathom" },
+    { "input": "bring up the m7 board resetter firmware on the bench", "expected": "m7" },
+    { "input": "verify reset pulse timing with the scope before flashing rev B", "expected": "m7" },
+    { "input": "debug remoteproc hang during M7 firmware boot", "expected": "m7" },
+    { "input": "align DTS carveouts with the TCM regions for the m7", "expected": "m7" },
+    { "input": "wire the ollama agent to auto-link new vault notes", "expected": "ollama" },
+    { "input": "benchmark local models for the note-classification agent", "expected": "ollama" },
+    { "input": "add a reranker to the local RAG pipeline", "expected": "ollama" },
+    { "input": "book the dentist appointment for next week", "expected": "personal" },
+    { "input": "renew the apartment lease before it expires", "expected": "personal" },
+    { "input": "pick up groceries on the way home", "expected": "personal" },
+    { "input": "email liz the bank verification letter for payroll", "expected": "personal" }
+  ]
+}
