@@ -7,11 +7,25 @@ import TaskCard from './components/TaskCard';
 import Calendar from './components/Calendar';
 import Chat from './components/Chat';
 import NoteHits from './components/NoteHits';
-import { TaskSheet, ProjectsSheet, LinkSheet, CaptureSheet } from './components/Sheets';
+import { TaskSheet, TaskDetailSheet, ProjectsSheet, ProjectSheet, LinkSheet, CaptureSheet } from './components/Sheets';
+import { SettingsMenu, SettingsPage } from './components/Settings';
 
 // v2: palette migrated to the A.L.F.R.E.D. theme — bumping keys reseeds project colors
 // v3: added the OBD2 CAN Reader project to the seed set
-const LS = { tasks: 'deck.tasks.v2', projects: 'deck.projects.v3', link: 'deck.link.v1' };
+const LS = {
+  tasks: 'deck.tasks.v2',
+  projects: 'deck.projects.v3',
+  link: 'deck.link.v1',
+  allLayout: 'deck.allLayout.v1',
+  railOpen: 'deck.railOpen.v1',
+  toolbarOpen: 'deck.toolbarOpen.v1',
+  zoom: 'deck.zoom.v1',
+};
+
+const ZOOM_MIN = 0.8;
+const ZOOM_MAX = 1.8;
+const ZOOM_STEP = 0.1;
+const clampZoom = (z) => Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z));
 
 function loadLS(key, fallback) {
   try {
@@ -53,6 +67,10 @@ export default function App() {
   const [priFilter, setPriFilter] = useState('all');
   const [projFilter, setProjFilter] = useState('all'); // all | none | <pid>  (All-tasks view)
   const [statusFilter, setStatusFilter] = useState('all'); // all | open | done  (All-tasks view)
+  const [allLayout, setAllLayout] = useState(() => loadLS(LS.allLayout, 'list')); // list | board  (All-tasks layout)
+  const [railOpen, setRailOpen] = useState(() => loadLS(LS.railOpen, true)); // left sidebar visible
+  const [toolbarOpen, setToolbarOpen] = useState(() => loadLS(LS.toolbarOpen, true)); // search/filter bar visible
+  const [zoom, setZoom] = useState(() => loadLS(LS.zoom, 1)); // content zoom for tasks/projects (kiosk readability)
   const [sheet, setSheet] = useState(null); // {kind:'task',task?} | {kind:'projects'} | {kind:'link'}
   const [linkStatus, setLinkStatus] = useState('');
   const [toast, setToast] = useState(null);
@@ -62,6 +80,53 @@ export default function App() {
   useEffect(() => localStorage.setItem(LS.tasks, JSON.stringify(tasks)), [tasks]);
   useEffect(() => localStorage.setItem(LS.projects, JSON.stringify(projects)), [projects]);
   useEffect(() => localStorage.setItem(LS.link, JSON.stringify(link)), [link]);
+  useEffect(() => localStorage.setItem(LS.allLayout, JSON.stringify(allLayout)), [allLayout]);
+  useEffect(() => localStorage.setItem(LS.railOpen, JSON.stringify(railOpen)), [railOpen]);
+  useEffect(() => localStorage.setItem(LS.toolbarOpen, JSON.stringify(toolbarOpen)), [toolbarOpen]);
+  useEffect(() => localStorage.setItem(LS.zoom, JSON.stringify(zoom)), [zoom]);
+
+  const bumpZoom = (delta) => setZoom((z) => clampZoom(Math.round((z + delta) * 10) / 10));
+
+  // Latest zoom for gesture math, so listeners never need re-attaching.
+  const zoomRef = useRef(zoom);
+  useEffect(() => { zoomRef.current = zoom; }, [zoom]);
+  const pinch = useRef({ startDist: 0, startZoom: 1 });
+
+  // Native pinch / ctrl-wheel gestures on the content area. Attached via a
+  // ref-callback so React 19 handles cleanup when the view (node) changes.
+  // - trackpad pinch & ctrl+wheel → the browser sends wheel events with ctrlKey
+  // - two-finger pinch on the touchscreen → touch events with 2 points
+  // Plain wheel / one-finger drag are left alone so scrolling still works.
+  const zoomGestureRef = useCallback((node) => {
+    if (!node) return;
+    const twoDist = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+    const onWheel = (e) => {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      const d = Math.max(-0.12, Math.min(0.12, -e.deltaY * 0.01));
+      setZoom((z) => clampZoom(z + d));
+    };
+    const onTouchStart = (e) => {
+      if (e.touches.length === 2) pinch.current = { startDist: twoDist(e.touches), startZoom: zoomRef.current };
+    };
+    const onTouchMove = (e) => {
+      if (e.touches.length === 2 && pinch.current.startDist > 0) {
+        e.preventDefault();
+        setZoom(clampZoom(pinch.current.startZoom * (twoDist(e.touches) / pinch.current.startDist)));
+      }
+    };
+    const onTouchEnd = (e) => { if (e.touches.length < 2) pinch.current.startDist = 0; };
+    node.addEventListener('wheel', onWheel, { passive: false });
+    node.addEventListener('touchstart', onTouchStart, { passive: false });
+    node.addEventListener('touchmove', onTouchMove, { passive: false });
+    node.addEventListener('touchend', onTouchEnd);
+    return () => {
+      node.removeEventListener('wheel', onWheel);
+      node.removeEventListener('touchstart', onTouchStart);
+      node.removeEventListener('touchmove', onTouchMove);
+      node.removeEventListener('touchend', onTouchEnd);
+    };
+  }, []);
 
   const pop = (msg, mood = '') => {
     clearTimeout(toastTimer.current);
@@ -69,23 +134,38 @@ export default function App() {
     toastTimer.current = setTimeout(() => setToast(null), 2400);
   };
 
-  // ---- hub detection ----
+  // Settings is a full-page view; remember where we came from so "Back" returns.
+  const prevViewRef = useRef('today');
+  const openSettings = () => {
+    if (view !== 'settings') prevViewRef.current = view;
+    setView('settings');
+  };
+  const closeSettings = () => setView(prevViewRef.current || 'today');
+
+  // ---- hub detection + project sync ----
   const useHubTasks = !!hub?.obsidian?.reachable;
 
-  useEffect(() => {
-    let live = true;
-    const probe = async () => {
+  // A single probe of whatever endpoint is active. Passed to the settings page
+  // so it can force an immediate re-check after switching endpoints.
+  const refreshHub = useCallback(async () => {
+    try {
+      const h = await deck.getHealth();
+      setHub(h);
       try {
-        const h = await deck.getHealth();
-        if (live) setHub(h);
-      } catch {
-        if (live) setHub(null);
-      }
-    };
-    probe();
-    const id = setInterval(probe, 30000);
-    return () => { live = false; clearInterval(id); };
+        // Pull the authoritative project list from the server so add/remove
+        // done in one browser session (or via Claude MCP) are reflected everywhere.
+        setProjects(await deck.getProjects());
+      } catch { /* hub up but projects endpoint failed — keep localStorage list */ }
+    } catch {
+      setHub(null);
+    }
   }, []);
+
+  useEffect(() => {
+    refreshHub();
+    const id = setInterval(refreshHub, 30000);
+    return () => clearInterval(id);
+  }, [refreshHub]);
 
   // ---- task sync (hub first, direct Obsidian link as fallback) ----
   const sync = useCallback(async (announce = false) => {
@@ -130,7 +210,35 @@ export default function App() {
   }, [sync]);
 
   // Tasks from today's daily note + locally-added ones — the focused "today" set.
-  const todayTasks = useMemo(() => [...obTasks, ...tasks], [obTasks, tasks]);
+  // Project assignment is TAG-DRIVEN: a vault task belongs to whichever project's
+  // tag (#fathom, #m7, …) appears on its line. The parser already resolves the
+  // built-in projects, but a project ADDED on the dashboard needs its tag honored
+  // too — so we re-classify here from the live projects list. We only fill in
+  // tasks that aren't already on a known project (so we never override the
+  // parser's specific-tag-wins choice), which lets a new project pick up any
+  // vault task carrying its tag without touching the backend.
+  const tagIndex = useMemo(() => {
+    const m = {};
+    for (const p of projects) {
+      const tg = (p.tag || '').replace(/^#/, '').toLowerCase().trim();
+      if (tg) m[tg] = p.id;
+    }
+    return m;
+  }, [projects]);
+  const projIds = useMemo(() => new Set(projects.map((p) => p.id)), [projects]);
+  const classify = useCallback(
+    (t) => {
+      if (t.source !== 'obsidian' || projIds.has(t.project)) return t;
+      for (const tag of t.tags || []) {
+        if (tagIndex[tag]) return { ...t, project: tagIndex[tag] };
+      }
+      return t;
+    },
+    [tagIndex, projIds],
+  );
+
+  const todayTasks = useMemo(() => [...obTasks, ...tasks].map(classify), [obTasks, tasks, classify]);
+  const backlogTasks = useMemo(() => backlog.map(classify), [backlog, classify]);
   // Everything: today's set PLUS the whole-vault open backlog, deduped by title
   // (today's copy wins so toggles write to the daily note). This pool feeds All
   // tasks, the project views, Done, search, and every count — so a task living in
@@ -138,9 +246,9 @@ export default function App() {
   // the backlog strip under Today.
   const all = useMemo(() => {
     const seen = new Set(todayTasks.map((t) => t.title.toLowerCase()));
-    const extra = backlog.filter((t) => !seen.has(t.title.toLowerCase()));
+    const extra = backlogTasks.filter((t) => !seen.has(t.title.toLowerCase()));
     return [...todayTasks, ...extra];
-  }, [todayTasks, backlog]);
+  }, [todayTasks, backlogTasks]);
   const projOf = (id) => projects.find((p) => p.id === id);
 
   // ---- mutations ----
@@ -192,16 +300,69 @@ export default function App() {
     pop('task deleted');
   };
 
-  const addProject = (name) => {
-    const id = 'p' + Date.now();
-    setProjects((ps) => [...ps, { id, name, tag: '', color: PALETTE[ps.length % PALETTE.length] }]);
+  const addProject = async (name, tag = '', color) => {
+    const clean = tag.replace(/^#/, '').toLowerCase().replace(/\s+/g, '-').trim();
+    const finalColor = color || PALETTE[projects.length % PALETTE.length];
+    const payload = { name, tag: clean, color: finalColor };
+    if (useHubTasks) {
+      try {
+        const proj = await deck.addProject(payload);
+        setProjects((ps) => ps.some((p) => p.id === proj.id) ? ps : [...ps, proj]);
+        pop(`+ project “${proj.name}” added`, 'good');
+      } catch (e) {
+        pop(e.message, 'bad');
+      }
+    } else {
+      const id = clean || 'p' + Date.now();
+      setProjects((ps) => {
+        if (ps.some((p) => p.id === id)) { pop('a project with that tag already exists', 'bad'); return ps; }
+        return [...ps, { id, name, tag: clean ? '#' + clean : '', color: finalColor }];
+      });
+    }
   };
 
-  const deleteProject = (id) => {
+  const editProject = async (id, patch) => {
+    const clean =
+      patch.tag !== undefined
+        ? patch.tag.replace(/^#/, '').toLowerCase().replace(/\s+/g, '-').trim()
+        : undefined;
+    if (useHubTasks) {
+      try {
+        const proj = await deck.updateProject(id, { ...patch, ...(clean !== undefined ? { tag: clean } : {}) });
+        setProjects((ps) => ps.map((p) => (p.id === proj.id ? proj : p)));
+        pop('project updated', 'good');
+      } catch (e) {
+        pop(e.message, 'bad');
+      }
+    } else {
+      setProjects((ps) =>
+        ps.map((p) =>
+          p.id === id
+            ? { ...p, ...patch, ...(clean !== undefined ? { tag: clean ? '#' + clean : '' } : {}) }
+            : p,
+        ),
+      );
+      pop('project updated', 'good');
+    }
+  };
+
+  const deleteProject = async (id) => {
     if (!confirm('Remove project? Its tasks move to “no project”.')) return;
-    setProjects((ps) => ps.filter((p) => p.id !== id));
-    setTasks((ts) => ts.map((t) => (t.project === id ? { ...t, project: '' } : t)));
-    if (view === 'p:' + id) setView('all');
+    if (useHubTasks) {
+      try {
+        await deck.removeProject(id);
+        setProjects((ps) => ps.filter((p) => p.id !== id));
+        setTasks((ts) => ts.map((t) => (t.project === id ? { ...t, project: '' } : t)));
+        if (view === 'p:' + id) setView('all');
+        pop('project removed', '');
+      } catch (e) {
+        pop(e.message, 'bad');
+      }
+    } else {
+      setProjects((ps) => ps.filter((p) => p.id !== id));
+      setTasks((ts) => ts.map((t) => (t.project === id ? { ...t, project: '' } : t)));
+      if (view === 'p:' + id) setView('all');
+    }
   };
 
   // ---- filtering ----
@@ -231,6 +392,7 @@ export default function App() {
     onEdit: (t) => setSheet({ kind: 'task', task: t }),
     onDelete: removeTask,
     onJumpProject: (id) => setView('p:' + id),
+    onOpen: (t) => setSheet({ kind: 'detail', task: t }),
   };
 
   const titleFor = () =>
@@ -282,7 +444,7 @@ export default function App() {
     // search/priority filters so the section narrows with everything else.
     const q = query.toLowerCase();
     const shownTitles = new Set(openF.map((t) => t.title.toLowerCase()));
-    const backlogOpen = backlog
+    const backlogOpen = backlogTasks
       .filter((t) => !shownTitles.has(t.title.toLowerCase()))
       .filter((t) => priFilter === 'all' || t.priority === priFilter)
       .filter((t) => !q || t.title.toLowerCase().includes(q));
@@ -363,6 +525,39 @@ export default function App() {
     const openF = allScoped.filter((t) => !t.done);
     const doneF = allScoped.filter((t) => t.done);
     const noProj = openF.filter((t) => !t.project || !projOf(t.project)).sort(sortOpen);
+
+    // Board layout: one column per project (plus an Inbox column for unfiled
+    // tasks), open tasks first then done. Honors the toolbar's project/status
+    // filters via allScoped.
+    if (allLayout === 'board') {
+      const inBoard = (t) => (t.done ? 1 : 0) - 0;
+      const colSort = (a, b) => inBoard(a) - inBoard(b) || sortOpen(a, b);
+      const inbox = allScoped.filter((t) => !t.project || !projOf(t.project));
+      const cols = [];
+      if (inbox.length) cols.push({ id: 'none', name: 'Inbox', color: 'var(--text-3)', proj: null, tasks: inbox });
+      projects.forEach((p) => {
+        const list = allScoped.filter((t) => t.project === p.id);
+        if (list.length) cols.push({ id: p.id, name: p.name, color: p.color, proj: p, tasks: list });
+      });
+      if (!cols.length) return renderStack([], 'Nothing matches', 'Try a different filter.');
+      return (
+        <div className="board">
+          {cols.map((c) => (
+            <div className="board-col" key={c.id}>
+              <div className="board-col-head" style={{ '--col': c.color }}>
+                <span className="board-col-name">{c.name}</span>
+                <span className="board-col-count">{c.tasks.length}</span>
+              </div>
+              <div className="board-col-body">
+                {c.tasks.slice().sort(colSort).map((t) => (
+                  <TaskCard key={t.id} task={t} project={c.proj} {...cardProps} />
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      );
+    }
 
     // When a single project is selected the per-project banding is noise — flat list.
     const flat = projFilter !== 'all';
@@ -473,7 +668,7 @@ export default function App() {
         const pct = list.length ? Math.round((doneN / list.length) * 100) : 0;
         const urg = openL.filter((t) => t.priority === 'urgent').length;
         return (
-          <div key={p.id} className="proj-card" style={{ '--edge': p.color }} onClick={() => setView('p:' + p.id)}>
+          <div key={p.id} className="proj-card" style={{ '--edge': p.color }} onClick={() => setSheet({ kind: 'project', project: p })}>
             <div className="proj-head">
               <div>
                 <div className="proj-name">{p.name}</div>
@@ -523,7 +718,7 @@ export default function App() {
         : { cls: '', label: 'hub offline' };
 
   return (
-    <div className="deck">
+    <div className={`deck${railOpen ? '' : ' rail-collapsed'}`}>
       <aside className="rail">
         <div className="rail-brand">
           <div className="rail-brand-name"><span className="beacon" />Mission Deck</div>
@@ -548,15 +743,31 @@ export default function App() {
         </div>
 
         <div className="rail-group">
-          <div className="rail-label">Projects</div>
+          <div className="rail-label-row">
+            <span className="rail-label">Projects</span>
+            <button
+              className="rail-add"
+              onClick={() => setSheet({ kind: 'project', project: null })}
+              title="New project"
+              aria-label="New project"
+            >+</button>
+          </div>
           {projects.map((p) => (
-            <button key={p.id} className={`rail-item${view === 'p:' + p.id ? ' on' : ''}`} onClick={() => setView('p:' + p.id)}>
-              <div className="rail-item-left">
-                <span className="pdot" style={{ background: p.color }} />
-                <span>{p.name}</span>
-              </div>
-              <span className="rail-count">{all.filter((t) => !t.done && t.project === p.id).length}</span>
-            </button>
+            <div key={p.id} className="rail-item-wrap">
+              <button className={`rail-item${view === 'p:' + p.id ? ' on' : ''}`} onClick={() => setView('p:' + p.id)}>
+                <div className="rail-item-left">
+                  <span className="pdot" style={{ background: p.color }} />
+                  <span>{p.name}</span>
+                </div>
+                <span className="rail-count">{all.filter((t) => !t.done && t.project === p.id).length}</span>
+              </button>
+              <button
+                className="rail-del"
+                onClick={() => deleteProject(p.id)}
+                title={`Delete ${p.name}`}
+                aria-label={`Delete project ${p.name}`}
+              >×</button>
+            </div>
           ))}
         </div>
 
@@ -575,7 +786,38 @@ export default function App() {
         </div>
       </aside>
 
+      {/* Always-present, vertically-centered edge tab: collapses the rail when
+          open, brings it back when closed. Fixed, so it never scrolls away. */}
+      <button
+        className={`rail-toggle${railOpen ? '' : ' is-collapsed'}`}
+        onClick={() => setRailOpen((o) => !o)}
+        title={railOpen ? 'Minimize sidebar' : 'Show sidebar'}
+        aria-label={railOpen ? 'Minimize sidebar' : 'Show sidebar'}
+      >
+        {railOpen ? '‹' : '›'}
+      </button>
+
       <main className="stage">
+        {/* Compact nav for small screens (the rail is hidden under 760px). */}
+        <nav className="mobile-nav">
+          <span className="mobile-brand"><span className="beacon" />Deck</span>
+          {[['today', 'Today'], ['all', 'All'], ['done', 'Done'], ['chat', 'Chat'], ['calendar', 'Cal'], ['projects', 'Projects']].map(([id, label]) => (
+            <button key={id} className={`mobile-tab${view === id || (id === 'projects' && view.startsWith('p:')) ? ' on' : ''}`} onClick={() => setView(id)}>
+              {label}
+            </button>
+          ))}
+          <button className="mobile-tab add" onClick={() => setSheet({ kind: 'task' })}>＋</button>
+          <SettingsMenu onOpenSettings={openSettings} />
+        </nav>
+
+        {view === 'settings' ? (
+          <SettingsPage
+            onBack={closeSettings}
+            hub={hub}
+            onEndpointsChanged={() => { refreshHub(); sync(); }}
+          />
+        ) : (
+        <>
         <header className="masthead">
           <div className="mast-left">
             <span className="mast-kicker">{greeting} · {fmtLong(todayISO())}</span>
@@ -595,10 +837,17 @@ export default function App() {
               </div>
               <div className="clock-date">{now.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })}</div>
             </div>
+            <SettingsMenu onOpenSettings={openSettings} />
           </div>
         </header>
 
-        {view !== 'projects' && view !== 'calendar' && view !== 'chat' && (
+        {view !== 'projects' && view !== 'calendar' && view !== 'chat' && !toolbarOpen && (
+          <button className="toolbar-show" onClick={() => setToolbarOpen(true)} title="Show search & filters">
+            ⌕ Search & filters
+          </button>
+        )}
+
+        {view !== 'projects' && view !== 'calendar' && view !== 'chat' && toolbarOpen && (
           <div className="toolbar">
             <div className="search">
               <span className="glyph">⌕</span>
@@ -623,12 +872,17 @@ export default function App() {
                   <option value="open">Open</option>
                   <option value="done">Done</option>
                 </select>
+                <div className="seg">
+                  <button className={allLayout === 'list' ? 'on' : ''} onClick={() => setAllLayout('list')} title="List view">☰ List</button>
+                  <button className={allLayout === 'board' ? 'on' : ''} onClick={() => setAllLayout('board')} title="Board view — columns by project">▦ Board</button>
+                </div>
               </>
             )}
             <div className="spacer" />
             {link.enabled && obState === 'live' && (
               <span className="ghost-note">◈ {obTasks.length} from vault · refreshes 45s</span>
             )}
+            <button className="toolbar-collapse" onClick={() => setToolbarOpen(false)} title="Minimize search & filters" aria-label="Minimize search bar">▴</button>
           </div>
         )}
 
@@ -636,10 +890,10 @@ export default function App() {
           <Chat
             projects={projects}
             claudeConfigured={!!hub?.claude?.configured}
-            onTasksChanged={() => sync()}
+            onTasksChanged={() => { sync(); refreshHub(); }}
           />
         ) : (
-          <div className="scroll">
+          <div className="scroll" style={{ zoom }} ref={zoomGestureRef}>
             {query.trim() && useHubTasks && (view === 'today' || view === 'all' || view === 'done' || view.startsWith('p:')) && (
               <NoteHits query={query} />
             )}
@@ -651,10 +905,30 @@ export default function App() {
             {view.startsWith('p:') && renderProject(view.slice(2))}
           </div>
         )}
+
+        {view !== 'chat' && (
+          <div className="zoom-dock" role="group" aria-label="Zoom tasks and projects">
+            <button className="zoom-btn" onClick={() => bumpZoom(-ZOOM_STEP)} disabled={zoom <= ZOOM_MIN} title="Zoom out" aria-label="Zoom out">−</button>
+            <button className="zoom-pct" onClick={() => setZoom(1)} title="Reset zoom to 100%" aria-label="Reset zoom">{Math.round(zoom * 100)}%</button>
+            <button className="zoom-btn" onClick={() => bumpZoom(ZOOM_STEP)} disabled={zoom >= ZOOM_MAX} title="Zoom in" aria-label="Zoom in">+</button>
+          </div>
+        )}
+        </>
+        )}
       </main>
 
       {sheet?.kind === 'task' && (
         <TaskSheet initial={sheet.task} projects={projects} onSave={saveTask} onClose={() => setSheet(null)} />
+      )}
+      {sheet?.kind === 'detail' && (
+        <TaskDetailSheet
+          task={sheet.task}
+          project={projOf(sheet.task.project)}
+          onToggle={toggle}
+          onEdit={(t) => setSheet({ kind: 'task', task: t })}
+          onDelete={removeTask}
+          onClose={() => setSheet(null)}
+        />
       )}
       {sheet?.kind === 'capture' && (
         <CaptureSheet
@@ -670,7 +944,18 @@ export default function App() {
           tasks={all}
           onAdd={addProject}
           onDelete={deleteProject}
-          onRecolor={(id, color) => setProjects((ps) => ps.map((p) => (p.id === id ? { ...p, color } : p)))}
+          onRecolor={(id, color) => editProject(id, { color })}
+          onClose={() => setSheet(null)}
+        />
+      )}
+      {sheet?.kind === 'project' && (
+        <ProjectSheet
+          project={sheet.project}
+          taskCount={sheet.project ? all.filter((t) => t.project === sheet.project.id).length : 0}
+          onCreate={(p) => addProject(p.name, p.tag, p.color)}
+          onSave={editProject}
+          onDelete={deleteProject}
+          onOpen={(id) => setView('p:' + id)}
           onClose={() => setSheet(null)}
         />
       )}

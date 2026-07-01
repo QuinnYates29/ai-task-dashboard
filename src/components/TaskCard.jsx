@@ -1,6 +1,6 @@
 import { daysUntil, dueLabel } from '../lib/dates';
 
-export default function TaskCard({ task, project, onToggle, onEdit, onDelete, onJumpProject }) {
+export default function TaskCard({ task, project, onToggle, onEdit, onDelete, onJumpProject, onOpen }) {
   const n = daysUntil(task.deadline);
   const dueClass = n === null ? '' : n < 0 ? 'late' : n === 0 ? 'today' : '';
   const edge = !task.done && task.priority === 'urgent' ? 'var(--coral)' : project?.color || 'transparent';
@@ -17,7 +17,12 @@ export default function TaskCard({ task, project, onToggle, onEdit, onDelete, on
         ✓
       </button>
 
-      <div className="card-mid">
+      <div
+        className={`card-mid${onOpen ? ' clickable' : ''}`}
+        onClick={onOpen ? () => onOpen(task) : undefined}
+        role={onOpen ? 'button' : undefined}
+        title={onOpen ? 'View details' : undefined}
+      >
         <div className="card-title">{task.title}</div>
         {task.notes && <div className="card-notes">{task.notes}</div>}
         <div className="tags">
@@ -26,7 +31,7 @@ export default function TaskCard({ task, project, onToggle, onEdit, onDelete, on
             <span
               className="tag proj"
               style={{ background: project.color + '22', color: project.color }}
-              onClick={() => onJumpProject(project.id)}
+              onClick={(e) => { e.stopPropagation(); onJumpProject(project.id); }}
             >
               ◆ {project.name}
             </span>

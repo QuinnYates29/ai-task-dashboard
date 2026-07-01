@@ -7,9 +7,26 @@
 // Local handles fast retrieval + simple create/complete deterministically.
 // Claude gets real tools (read tasks, search vault, create, complete) and a
 // proper agent loop, so it can plan and act in one turn.
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { config } from './config.js';
 import { anthropic, complete, localCompleteStream, type Provider } from './router.js';
+
+// Diagnostic logger — mirrors A.L.F.R.E.D. agent activity to the console AND to
+// .data/alfred.log so tool-call behavior can be inspected after the fact.
+const LOG_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '.data', 'alfred.log');
+function dlog(msg: string): void {
+  const line = `${new Date().toISOString()} ${msg}`;
+  console.log(line);
+  try {
+    fs.appendFileSync(LOG_FILE, line + '\n');
+  } catch {
+    /* logging is best-effort */
+  }
+}
 import { pullTasks, createTask, completeTaskByQuery } from './tasks.js';
+import { getProjects, addProject, removeProject } from './projects.js';
 import { searchSimple } from './obsidian.js';
 import { appendToDaily, appendToNote } from './notes.js';
 import { similarTasks, searchNotes, nearestProject } from './rag.js';
@@ -135,6 +152,57 @@ function detectIntent(text: string): 'create' | 'complete' | 'ask' {
   return 'ask';
 }
 
+// Deterministic project commands — a safety net for the local model, which
+// frequently *claims* it created/deleted a project without ever calling the
+// tool. Only fires on clear imperatives (not questions), so ordinary chat still
+// goes to the model.
+type ProjectIntent =
+  | { action: 'create'; name: string; tag?: string }
+  | { action: 'delete'; ref: string };
+
+export function detectProjectIntent(text: string): ProjectIntent | null {
+  const t = text.trim();
+  if (!/\bprojects?\b/i.test(t)) return null;
+  // Skip questions / hypotheticals — those are for the model to answer.
+  if (/\?\s*$/.test(t) || /^\s*(should|could|would|can|do|does|what|how|why|is|are|which)\b/i.test(t)) return null;
+
+  if (/\b(delete|remove|drop|get rid of|archive)\b/i.test(t)) {
+    const m =
+      t.match(/\b(?:delete|remove|drop|archive)\b\s+(?:the\s+)?["“]?([^"”]+?)["”]?\s+project\b/i) ||
+      t.match(/\bproject\b\s*[:#-]?\s*["“]?([^"”]+?)["”]?\s*$/i);
+    const ref = (m?.[1] || '').replace(/\b(the|a|an|my|please|named|called)\b/gi, '').trim();
+    return ref ? { action: 'delete', ref } : null;
+  }
+
+  if (/\b(create|add|make|new|start|set ?up)\b/i.test(t)) {
+    const m =
+      t.match(/\bproject\b\s+(?:called|named|titled)\s+["“]?([^"”]+?)["”]?(?:\s+(?:with|using|and|tagged|colou?r|,|\.)|$)/i) ||
+      t.match(/\b(?:called|named|titled)\s+["“]?([^"”]+?)["”]?(?:\s+(?:with|tagged|colou?r|,|\.)|$)/i) ||
+      t.match(/\bproject\b\s+["“]?([A-Za-z0-9][\w\-/&]*(?:\s+[\w\-/&]+){0,3})["”]?\s*$/i);
+    const name = (m?.[1] || '').trim().replace(/^(for\s+(the\s+|a\s+)?)/i, '').trim();
+    const tagM = t.match(/\b(?:tag|tagged|hashtag)\s+#?([\w-]+)/i) || t.match(/(?:^|\s)#([\w-]+)/);
+    return name ? { action: 'create', name, tag: tagM?.[1] } : null;
+  }
+  return null;
+}
+
+async function execProjectIntent(pi: ProjectIntent): Promise<{ text: string; action?: { tool: string; detail: string } }> {
+  if (pi.action === 'create') {
+    const p = addProject({ name: pi.name, tag: pi.tag });
+    return {
+      text: `✓ Created project **${p.name}**${p.tag ? ` (#${p.tag})` : ''}. Vault tasks tagged that way will file here.`,
+      action: { tool: 'create_project', detail: p.name },
+    };
+  }
+  const id = resolveProjectId(pi.ref);
+  if (!id) return { text: `I couldn't find a project matching “${pi.ref}”. Check the exact name and try again.` };
+  removeProject(id);
+  return {
+    text: `✓ Deleted project **${id}**. Its tasks were kept — they just lost the label.`,
+    action: { tool: 'delete_project', detail: id },
+  };
+}
+
 function summarizeTasks(tasks: any[]): string {
   const open = tasks.filter((t) => !t.done);
   const done = tasks.filter((t) => t.done);
@@ -175,6 +243,19 @@ ${notesBlock ? `\nRELEVANT NOTES:\n${notesBlock}` : ''}`;
 
 // ── local path ───────────────────────────────────────────────────────────────
 async function chatLocal(messages: ChatMsg[], projects: any[]): Promise<ChatResult> {
+  // Deterministic project add/delete — runs regardless of tool-calling support.
+  const pIntent = detectProjectIntent(messages[messages.length - 1]?.content ?? '');
+  if (pIntent) {
+    try {
+      const r = await execProjectIntent(pIntent);
+      dlog(`[alfred] deterministic project ${pIntent.action} → ${r.action?.detail ?? 'not found'}`);
+      return { text: r.text, provider: 'local', actions: r.action ? [r.action] : [] };
+    } catch (e: any) {
+      dlog(`[alfred] project intent failed: ${e.message}`);
+      return { text: `Couldn't do that — ${e.message}`, provider: 'local', actions: [] };
+    }
+  }
+
   // If the local model supports tool-calling, let it run the full agent loop.
   if (config.ollama.tools) return chatLocalAgent(messages, projects);
 
@@ -255,6 +336,38 @@ const CHAT_TOOLS = [
     },
   },
   {
+    name: 'list_projects',
+    description:
+      "List Quinn's projects (id, name, tag, color). Call this before deleting a project so you use the correct id, or to check whether a project already exists before creating one.",
+    input_schema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'create_project',
+    description:
+      "Create a new project on Quinn's dashboard. `name` is required. `tag` is the vault hashtag without the # (e.g. \"rover\"); if omitted it's derived from the name. `color` is an optional hex like #4d9fff. Fails if a project with the same id/tag already exists.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        tag: { type: 'string' },
+        color: { type: 'string' },
+      },
+      required: ['name'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'delete_project',
+    description:
+      "Delete a project by its id, name, or tag. This only removes the project from the dashboard — its tasks are NOT deleted, they just lose the project label. Confirm you have the right one via list_projects first.",
+    input_schema: {
+      type: 'object',
+      properties: { project: { type: 'string', description: 'id, name, or tag of the project to remove' } },
+      required: ['project'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'search_notes',
     description:
       'Semantic search over the whole Obsidian vault. Returns the most relevant note sections (with their file paths) — use this to answer from notes or to find the right note to append to.',
@@ -295,13 +408,41 @@ const CHAT_TOOLS = [
   },
 ];
 
+// Resolve a free-text project reference (id, #tag, or name — exact then partial)
+// to a real project id, so the model can delete by whatever it has on hand.
+function resolveProjectId(q: string): string | null {
+  const needle = String(q || '').replace(/^#/, '').toLowerCase().trim();
+  if (!needle) return null;
+  const projects = getProjects();
+  const byId = projects.find((p) => p.id.toLowerCase() === needle);
+  if (byId) return byId.id;
+  const byTag = projects.find((p) => (p.tag || '').toLowerCase() === needle);
+  if (byTag) return byTag.id;
+  const byName = projects.find((p) => p.name.toLowerCase() === needle);
+  if (byName) return byName.id;
+  const partial = projects.find((p) => p.name.toLowerCase().includes(needle));
+  return partial ? partial.id : null;
+}
+
 async function runTool(name: string, input: any): Promise<string> {
+  dlog(`[alfred] tool → ${name}(${JSON.stringify(input ?? {}).slice(0, 400)})`);
   if (name === 'list_tasks') return JSON.stringify(await pullTasks());
   if (name === 'search_vault') return JSON.stringify(await searchSimple(input.query)).slice(0, 4000);
   if (name === 'create_task') return 'Created: ' + (await createTask(input));
   if (name === 'complete_task') {
     const { matched } = await completeTaskByQuery(input.query);
     return 'Completed: ' + matched;
+  }
+  if (name === 'list_projects') return JSON.stringify(getProjects());
+  if (name === 'create_project') {
+    const p = addProject({ name: input.name, tag: input.tag, color: input.color });
+    return `Created project "${p.name}" (id ${p.id}${p.tag ? ', #' + p.tag : ''})`;
+  }
+  if (name === 'delete_project') {
+    const id = resolveProjectId(input.project);
+    if (!id) return `No project matches "${input.project}". Use list_projects to see the exact ids.`;
+    removeProject(id);
+    return `Deleted project "${id}". Its tasks were kept.`;
   }
   if (name === 'search_notes') return JSON.stringify(await searchNotes(input.query, 5));
   if (name === 'append_to_note') {
@@ -320,8 +461,9 @@ async function chatClaude(messages: ChatMsg[], projects: any[]): Promise<ChatRes
   const system = `You are ${ASSISTANT_NAME}, Quinn's task and vault assistant. Today is ${today}.
 Projects (use these ids for a task's project):
 ${projectLines(projects)}
-You can read tasks, search the vault, create tasks, and complete tasks via tools.
-When asked to add or finish something, just do it with the tools, then confirm briefly.
+You can read tasks, search the vault, create tasks, complete tasks, and manage projects (list/create/delete) via tools.
+When asked to add, finish, or organize something, just do it with the tools, then confirm briefly.
+For deleting a project, call list_projects first to get the exact id.
 Be concise and action-oriented. Never access anything under Independent/.`;
 
   const convo: any[] = messages.map((m) => ({ role: m.role, content: m.content }));
@@ -367,6 +509,9 @@ Be concise and action-oriented. Never access anything under Independent/.`;
 function shortDetail(name: string, input: any): string {
   if (name === 'create_task') return input.title ?? '';
   if (name === 'complete_task') return input.query ?? '';
+  if (name === 'create_project') return input.name ?? '';
+  if (name === 'delete_project') return input.project ?? '';
+  if (name === 'list_projects') return 'projects';
   if (name === 'search_vault' || name === 'search_notes') return input.query ?? '';
   if (name === 'append_to_note') return input.path ?? '';
   if (name === 'append_to_daily') return 'daily note';
@@ -384,13 +529,14 @@ async function chatLocalAgent(messages: ChatMsg[], projects: any[]): Promise<Cha
   const system = `You are ${ASSISTANT_NAME}, Quinn's task and vault assistant. Today is ${today}.
 Projects (use these ids for a task's project):
 ${projectLines(projects)}
-Use your tools to read tasks, search the vault, create tasks, complete tasks, and save notes. Be concise and action-oriented. Never access anything under Independent/.`;
+Use your tools to read tasks, search the vault, create tasks, complete tasks, manage projects (list/create/delete), and save notes. To delete a project, call list_projects first so you use the exact id. Be concise and action-oriented. Never access anything under Independent/.`;
 
   const convo: any[] = [
     { role: 'system', content: system },
     ...messages.map((m) => ({ role: m.role, content: m.content })),
   ];
   const actions: { tool: string; detail: string }[] = [];
+  dlog(`[alfred] local agent · model=${config.ollama.chatModel} · user="${(messages[messages.length - 1]?.content ?? '').slice(0, 160)}"`);
 
   for (let step = 0; step < 5; step++) {
     const r = await fetch(`${config.ollama.url}/api/chat`, {
@@ -404,7 +550,11 @@ Use your tools to read tasks, search the vault, create tasks, complete tasks, an
     convo.push(msg);
 
     const calls = msg.tool_calls ?? [];
-    if (!calls.length) return { text: msg.content ?? '', provider: 'local', actions };
+    dlog(`[alfred] step ${step}: ${calls.length} tool call(s)${calls.length ? ' → ' + calls.map((c: any) => c.function?.name).join(', ') : ' — model replied with text, no tool used'}`);
+    if (!calls.length) {
+      if (msg.content) dlog(`[alfred]   reply: ${String(msg.content).slice(0, 240)}`);
+      return { text: msg.content ?? '', provider: 'local', actions };
+    }
 
     for (const call of calls) {
       const name = call.function?.name;
@@ -419,9 +569,11 @@ Use your tools to read tasks, search the vault, create tasks, complete tasks, an
       let out: string;
       try {
         out = await runTool(name, input);
+        dlog(`[alfred]   ✓ ${name}: ${out.slice(0, 160)}`);
         actions.push({ tool: name, detail: shortDetail(name, input) });
       } catch (e: any) {
         out = 'Error: ' + e.message;
+        dlog(`[alfred]   ✗ ${name} failed: ${e.message}`);
       }
       convo.push({ role: 'tool', content: out });
     }
@@ -478,6 +630,21 @@ export async function routeChatStream(
 }
 
 async function chatLocalStream(messages: ChatMsg[], projects: any[], emit: Emit): Promise<void> {
+  // Deterministic project add/delete — bypasses the (unreliable) local tool loop.
+  const pIntent = detectProjectIntent(messages[messages.length - 1]?.content ?? '');
+  if (pIntent) {
+    try {
+      const r = await execProjectIntent(pIntent);
+      dlog(`[alfred] deterministic project ${pIntent.action} → ${r.action?.detail ?? 'not found'}`);
+      if (r.action) emit({ type: 'action', tool: r.action.tool, detail: r.action.detail });
+      emit({ type: 'delta', text: r.text });
+    } catch (e: any) {
+      dlog(`[alfred] project intent failed: ${e.message}`);
+      emit({ type: 'delta', text: `Couldn't do that — ${e.message}` });
+    }
+    return;
+  }
+
   // Tool-calling local models run the agent loop (non-streamed), then we emit the result.
   if (config.ollama.tools) {
     const res = await chatLocalAgent(messages, projects);
@@ -524,8 +691,9 @@ async function chatClaudeStream(messages: ChatMsg[], projects: any[], emit: Emit
   const system = `You are ${ASSISTANT_NAME}, Quinn's task and vault assistant. Today is ${today}.
 Projects (use these ids for a task's project):
 ${projectLines(projects)}
-You can read tasks, search the vault, create tasks, and complete tasks via tools.
-When asked to add or finish something, just do it with the tools, then confirm briefly.
+You can read tasks, search the vault, create tasks, complete tasks, and manage projects (list/create/delete) via tools.
+When asked to add, finish, or organize something, just do it with the tools, then confirm briefly.
+For deleting a project, call list_projects first to get the exact id.
 Be concise and action-oriented. Never access anything under Independent/.`;
 
   const convo: any[] = messages.map((m) => ({ role: m.role, content: m.content }));

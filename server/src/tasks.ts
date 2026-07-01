@@ -2,26 +2,10 @@
 // Mirrors the frontend parser so the server can become the single source of truth.
 import { config } from './config.js';
 import { readDaily, writeDaily, vaultGet, vaultPut, listFiles } from './obsidian.js';
+import { getTagProject, getProjectTag, getManagedTags, getProjectOrder } from './projects.js';
 
 const CHECKBOX = /^(\s*)- \[( |x|X)\] (.+)$/;
 const LISTITEM = /^\s*(?:\d+\.|[-*])\s+(.+)$/;
-
-// Vault tags → dashboard project ids (per HOME.md project table).
-const TAG_PROJECT: Record<string, string> = {
-  fathom: 'fathom',
-  m7: 'm7',
-  ollama: 'ollama',
-  obd2: 'obd2',
-  personal: 'personal',
-};
-// Reverse: project id → vault tag, for writing new tasks.
-const PROJECT_TAG: Record<string, string> = {
-  fathom: '#fathom',
-  m7: '#m7',
-  ollama: '#ollama',
-  obd2: '#obd2',
-  personal: '#personal',
-};
 
 function todayISO(): string {
   const d = new Date();
@@ -42,13 +26,13 @@ function extractMeta(raw: string) {
     .replace(/\(due:?\s*\d{4}-\d{2}-\d{2}\)/gi, '')
     .replace(/\s+/g, ' ')
     .trim();
-  // Specific project tags win over the generic #personal category — tasks are
-  // often tagged "#personal #ollama" and the project (#ollama) is the real one.
+  // Specific project tags win over the generic #personal category. Order comes
+  // from the project store (personal last); dynamic so new projects are picked up.
+  const tagProject = getTagProject();
   let project = '';
-  for (const id of ['fathom', 'm7', 'ollama', 'obd2', 'personal']) {
-    if (tags.includes(id) && TAG_PROJECT[id]) {
-      project = TAG_PROJECT[id];
-      break;
+  for (const id of getProjectOrder()) {
+    if (tags.includes(tagProject[id] ? id : '') || tags.includes(id)) {
+      if (tagProject[id]) { project = id; break; }
     }
   }
   const priority = tags.includes('urgent') ? 'urgent' : tags.includes('low') ? 'low' : 'medium';
@@ -210,22 +194,19 @@ export async function toggleTask(task: any): Promise<void> {
   await writeTarget(target, lines.join('\n'));
 }
 
-// Project ids + priority keywords that buildLine re-emits from the canonical
-// project/priority fields — stripped from free tags so an edit can't leave a
-// stale "#fathom" behind when the project changes.
-const MANAGED_TAGS = new Set(['fathom', 'm7', 'ollama', 'obd2', 'personal', 'urgent', 'low']);
-
 // Build a vault task line: "- [mark] Title #tags 📅 YYYY-MM-DD"
 function buildLine(mark: ' ' | 'x', t: any, indent = ''): string {
+  const MANAGED_TAGS = getManagedTags();
   const tags = new Set<string>(
     (t.tags ?? [])
       .map((x: string) => x.replace(/^#/, '').toLowerCase())
       .filter((x: string) => x && !MANAGED_TAGS.has(x))
       .map((x: string) => '#' + x),
   );
+  const projectTag = getProjectTag();
   if (t.priority === 'urgent') tags.add('#urgent');
   if (t.priority === 'low') tags.add('#low');
-  if (t.project && PROJECT_TAG[t.project]) tags.add(PROJECT_TAG[t.project]);
+  if (t.project && projectTag[t.project]) tags.add(projectTag[t.project]);
 
   let line = `${indent}- [${mark}] ${String(t.title).trim()}`;
   if (tags.size) line += ' ' + [...tags].join(' ');

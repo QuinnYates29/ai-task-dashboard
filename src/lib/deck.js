@@ -1,19 +1,62 @@
 // Client for the Deck Server hub (server/). When the hub is reachable the app
 // routes vault reads/writes and all AI through it; otherwise it falls back to
 // the browser's direct Obsidian link.
+//
+// The hub address + auth token are resolved per-request from the active
+// "endpoint profile" in localStorage, so switching where the dashboard points
+// (Local → LAN → Remote) takes effect immediately, no reload. The token is sent
+// as `Authorization: Bearer …` on every call — the server doesn't enforce it yet
+// (see server/ TODO), but the wire format is ready for when it does.
 
-const HUB_URL = (() => {
+const EP_KEY = 'deck.endpoints.v1';
+const DEFAULT_URL = 'http://127.0.0.1:8787';
+
+export const DEFAULT_ENDPOINTS = {
+  activeId: 'local',
+  profiles: [{ id: 'local', name: 'Local', url: DEFAULT_URL, token: '' }],
+};
+
+export function loadEndpoints() {
   try {
-    return localStorage.getItem('deck.hubUrl') || 'http://127.0.0.1:8787';
+    const raw = JSON.parse(localStorage.getItem(EP_KEY));
+    if (raw && Array.isArray(raw.profiles) && raw.profiles.length) return raw;
   } catch {
-    return 'http://127.0.0.1:8787';
+    /* ignore */
   }
-})();
+  // Migrate a legacy single hub URL if the user set one before profiles existed.
+  try {
+    const legacy = localStorage.getItem('deck.hubUrl');
+    if (legacy) return { activeId: 'local', profiles: [{ id: 'local', name: 'Local', url: legacy, token: '' }] };
+  } catch {
+    /* ignore */
+  }
+  return DEFAULT_ENDPOINTS;
+}
 
-export { HUB_URL };
+export function saveEndpoints(ep) {
+  try {
+    localStorage.setItem(EP_KEY, JSON.stringify(ep));
+  } catch {
+    /* ignore */
+  }
+}
+
+function activeProfile() {
+  const ep = loadEndpoints();
+  return ep.profiles.find((p) => p.id === ep.activeId) || ep.profiles[0] || DEFAULT_ENDPOINTS.profiles[0];
+}
+
+function hubUrl() {
+  return (activeProfile().url || DEFAULT_URL).replace(/\/+$/, '');
+}
+
+function authHeaders(extra = {}) {
+  const tok = activeProfile().token;
+  return tok ? { Authorization: `Bearer ${tok}`, ...extra } : { ...extra };
+}
 
 async function jx(path, opts = {}) {
-  const r = await fetch(HUB_URL + path, opts);
+  const r = await fetch(hubUrl() + path, { ...opts, headers: authHeaders(opts.headers || {}) });
   if (!r.ok) {
     let msg;
     try {
@@ -28,9 +71,24 @@ async function jx(path, opts = {}) {
 
 const JSON_POST = (body) => ({
   method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
+  headers: authHeaders({ 'Content-Type': 'application/json' }),
   body: JSON.stringify(body),
 });
+
+// Probe an arbitrary endpoint (used by the settings "Test connection" button,
+// which needs to check a profile the user is editing but hasn't activated yet).
+export async function getHealthAt(url, token) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 3000);
+  try {
+    const headers = token ? { Authorization: `Bearer ${token}` } : {};
+    const r = await fetch((url || '').replace(/\/+$/, '') + '/api/health', { signal: ctrl.signal, headers });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.json();
+  } finally {
+    clearTimeout(t);
+  }
+}
 
 // Health with a short timeout so the UI never hangs when the hub is down.
 export async function getHealth() {
@@ -61,7 +119,7 @@ export async function chat(messages, projects, mode) {
 
 // Streaming chat over SSE. `onEvent` receives {type:'meta'|'delta'|'action'|'note'|'done'|'error', ...}.
 export async function chatStream(messages, projects, mode, onEvent) {
-  const r = await fetch(HUB_URL + '/api/ai/chat/stream', JSON_POST({ messages, projects, mode }));
+  const r = await fetch(hubUrl() + '/api/ai/chat/stream', JSON_POST({ messages, projects, mode }));
   if (!r.ok || !r.body) {
     let msg;
     try {
@@ -105,9 +163,31 @@ export async function ingest(messages, projects, mode) {
 }
 
 export async function searchNotes(q, signal) {
-  return (await (await fetch(`${HUB_URL}/api/search?q=${encodeURIComponent(q)}`, { signal })).json()).notes || [];
+  return (await (await fetch(`${hubUrl()}/api/search?q=${encodeURIComponent(q)}`, { signal, headers: authHeaders() })).json()).notes || [];
 }
 
 export async function openNote(path) {
   return jx('/api/notes/open', JSON_POST({ path }));
+}
+
+export async function getProjects() {
+  return (await jx('/api/projects')).projects;
+}
+
+export async function addProject(p) {
+  return (await jx('/api/projects', JSON_POST(p))).project;
+}
+
+export async function updateProject(id, patch) {
+  return (
+    await jx('/api/projects/' + encodeURIComponent(id), {
+      method: 'PUT',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(patch),
+    })
+  ).project;
+}
+
+export async function removeProject(id) {
+  return jx('/api/projects/' + encodeURIComponent(id), { method: 'DELETE' });
 }

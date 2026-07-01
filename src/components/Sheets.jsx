@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { PALETTE } from '../lib/seed';
+import { dueLabel } from '../lib/dates';
 import * as deck from '../lib/deck';
 
 function Veil({ onClose, children }) {
@@ -73,17 +74,77 @@ export function TaskSheet({ initial, projects, onSave, onClose }) {
   );
 }
 
+// Read-only detail popup opened by tapping a task card. Surfaces everything we
+// know about a task plus quick actions. Edit/Delete only show for local tasks
+// (vault tasks are edited in Obsidian); Complete/Reopen works for all.
+export function TaskDetailSheet({ task, project, onToggle, onEdit, onDelete, onClose }) {
+  const isVault = task.source === 'obsidian';
+  const readonly = task.ob?.readonly;
+  const rows = [
+    ['Status', task.done ? '✓ Done' : '○ Open'],
+    ['Project', project ? project.name : '—'],
+    ['Priority', task.priority],
+    ['Deadline', task.deadline ? dueLabel(task.deadline) : '—'],
+    task.section ? ['Section', task.section] : null,
+    ['Source', isVault ? (readonly ? 'Obsidian (display-only)' : 'Obsidian vault') : 'Local'],
+    task.doneDate ? ['Completed', task.doneDate] : null,
+  ].filter(Boolean);
+
+  return (
+    <Veil onClose={onClose}>
+      <div className="detail-head">
+        {project && <span className="detail-dot" style={{ background: project.color }} />}
+        <div className="sheet-title" style={{ margin: 0 }}>{task.title}</div>
+      </div>
+
+      {task.notes && (
+        <div className="field" style={{ marginBottom: 18 }}>
+          <label>Notes</label>
+          <div className="detail-notes">{task.notes}</div>
+        </div>
+      )}
+
+      <div className="detail-grid">
+        {rows.map(([k, v]) => (
+          <div className="detail-row" key={k}>
+            <label>{k}</label>
+            <span className="detail-v">{v}</span>
+          </div>
+        ))}
+      </div>
+
+      <div className="sheet-ops">
+        {!readonly && (
+          <button className="btn primary" onClick={() => { onToggle(task); onClose(); }}>
+            {task.done ? '↺ Reopen' : '✓ Complete'}
+          </button>
+        )}
+        {!isVault && <button className="btn" onClick={() => onEdit(task)}>✎ Edit</button>}
+        {!isVault && <button className="btn danger" onClick={() => { onDelete(task); onClose(); }}>✕ Delete</button>}
+        <button className="btn" onClick={onClose}>Close</button>
+      </div>
+    </Veil>
+  );
+}
+
 export function ProjectsSheet({ projects, tasks, onAdd, onDelete, onRecolor, onClose }) {
   const [name, setName] = useState('');
+  const [tag, setTag] = useState('');
   const add = () => {
     if (!name.trim()) return;
-    onAdd(name.trim());
+    onAdd(name.trim(), tag.trim());
     setName('');
+    setTag('');
   };
 
   return (
     <Veil onClose={onClose}>
       <div className="sheet-title">Projects</div>
+      <div className="hint">
+        A project's <strong>tag</strong> is what links it to your tasks. Any vault
+        task whose line carries that tag (e.g. <code>#robot</code>) is filed under
+        this project automatically. Leave the tag blank for a manual-only project.
+      </div>
       <div style={{ marginBottom: 16 }}>
         {projects.map((p) => (
           <div className="proj-row-edit" key={p.id}>
@@ -97,6 +158,9 @@ export function ProjectsSheet({ projects, tasks, onAdd, onDelete, onRecolor, onC
               }}
             />
             <span className="name">{p.name}</span>
+            <span className="tag proj" style={{ background: p.color + '22', color: p.color }}>
+              {p.tag || 'no tag'}
+            </span>
             <span className="n">{tasks.filter((t) => t.project === p.id).length} tasks</span>
             <button className="op danger" onClick={() => onDelete(p.id)} title="Remove">✕</button>
           </div>
@@ -104,15 +168,98 @@ export function ProjectsSheet({ projects, tasks, onAdd, onDelete, onRecolor, onC
       </div>
       <div style={{ display: 'flex', gap: 8 }}>
         <input
+          style={{ flex: 2 }}
           value={name}
           onChange={(e) => setName(e.target.value)}
           placeholder="New project name…"
+          onKeyDown={(e) => e.key === 'Enter' && add()}
+        />
+        <input
+          style={{ flex: 1 }}
+          value={tag}
+          onChange={(e) => setTag(e.target.value)}
+          placeholder="#tag (optional)"
           onKeyDown={(e) => e.key === 'Enter' && add()}
         />
         <button className="btn primary" onClick={add}>Add</button>
       </div>
       <div className="sheet-ops">
         <button className="btn" onClick={onClose}>Done</button>
+      </div>
+    </Veil>
+  );
+}
+
+// Create OR manage a single project. Opened for a NEW project (project == null)
+// from the sidebar "+", or to manage an existing one from a project card.
+export function ProjectSheet({ project, taskCount = 0, onCreate, onSave, onDelete, onOpen, onClose }) {
+  const isNew = !project;
+  const [f, setF] = useState({
+    name: project?.name || '',
+    tag: (project?.tag || '').replace(/^#/, ''),
+    color: project?.color || PALETTE[0],
+  });
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const submit = () => {
+    if (!f.name.trim()) return;
+    if (isNew) onCreate({ name: f.name.trim(), tag: f.tag, color: f.color });
+    else onSave(project.id, { name: f.name.trim(), tag: f.tag, color: f.color });
+    onClose();
+  };
+  const remove = () => {
+    onDelete(project.id);
+    onClose();
+  };
+
+  return (
+    <Veil onClose={onClose}>
+      <div className="sheet-title" style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <span className="pdot" style={{ background: f.color, width: 12, height: 12, borderRadius: 4 }} />
+        {isNew ? 'New project' : 'Manage project'}
+      </div>
+
+      <div className="field">
+        <label>Name</label>
+        <input
+          autoFocus
+          value={f.name}
+          onChange={set('name')}
+          placeholder="Project name…"
+          onKeyDown={(e) => e.key === 'Enter' && submit()}
+        />
+      </div>
+      <div className="field">
+        <label>Tag <span style={{ color: 'var(--text-3)', fontWeight: 400 }}>vault tasks with this #tag file here</span></label>
+        <input value={f.tag} onChange={set('tag')} placeholder="#tag (optional)" />
+      </div>
+      <div className="field">
+        <label>Color</label>
+        <div className="swatch-row">
+          {PALETTE.map((c) => (
+            <button
+              key={c}
+              className={`swatch${f.color === c ? ' on' : ''}`}
+              style={{ background: c }}
+              onClick={() => setF({ ...f, color: c })}
+              title={c}
+              aria-label={`Set color ${c}`}
+            />
+          ))}
+        </div>
+      </div>
+
+      {!isNew && (
+        <div className="hint">
+          {taskCount} task{taskCount === 1 ? '' : 's'} filed here. Deleting keeps the tasks — they just lose the project label.
+        </div>
+      )}
+
+      <div className="sheet-ops">
+        {!isNew && <button className="btn danger" onClick={remove}>Delete</button>}
+        {!isNew && <button className="btn" onClick={() => { onOpen(project.id); onClose(); }}>Open tasks →</button>}
+        <div className="spacer" />
+        <button className="btn" onClick={onClose}>Cancel</button>
+        <button className="btn primary" onClick={submit}>{isNew ? 'Add project' : 'Save'}</button>
       </div>
     </Veil>
   );

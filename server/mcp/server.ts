@@ -38,6 +38,24 @@ async function postJSON(path: string, payload: any): Promise<any> {
   return body;
 }
 
+async function putJSON(path: string, payload: any): Promise<any> {
+  const r = await fetch(DECK + path, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body?.error || `${path}: ${r.status}`);
+  return body;
+}
+
+async function delJSON(path: string): Promise<any> {
+  const r = await fetch(DECK + path, { method: 'DELETE' });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body?.error || `${path}: ${r.status}`);
+  return body;
+}
+
 // MCP tool results are text blocks; ok() wraps success, fail() surfaces errors.
 const ok = (text: string) => ({ content: [{ type: 'text' as const, text }] });
 const fail = (e: unknown) => ({
@@ -63,9 +81,19 @@ async function findTask(id: string): Promise<any> {
   return t;
 }
 
-const PROJECT = z
-  .enum(['fathom', 'm7', 'ollama', 'obd2', 'personal', 'none'])
-  .describe('Project bucket. fathom=BIST/FATHOM, m7=M7 Resetter, ollama=Ollama Multi-Agent, obd2=OBD2 CAN Reader, personal, or none.');
+// PROJECT is dynamic — pulled from the Deck Server so new projects added via the
+// dashboard are immediately available here too. We use z.string() to avoid a
+// static enum; the Deck Server validates the id on write.
+async function projectDescription(): Promise<string> {
+  try {
+    const { projects } = await getJSON('/api/projects');
+    const list = (projects as any[]).map((p: any) => `${p.id}=${p.name}`).join(', ');
+    return `Project id. One of: ${list}, or "none".`;
+  } catch {
+    return 'Project id (e.g. fathom, m7, ollama, obd2, personal) or "none".';
+  }
+}
+const PROJECT = z.string().optional();
 const PRIORITY = z.enum(['urgent', 'medium', 'low']);
 
 const server = new McpServer({ name: 'mission-deck', version: '0.1.0' });
@@ -208,6 +236,88 @@ server.registerTool(
         .map((n: any) => `• ${n.path}${n.heading ? ' › ' + n.heading : ''}${n.score != null ? `  (${n.score.toFixed(3)})` : ''}\n  ${(n.text || n.snippet || '').slice(0, 200).replace(/\s+/g, ' ').trim()}`)
         .join('\n\n');
       return ok(out);
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+// ── list_projects ────────────────────────────────────────────────────────────
+server.registerTool(
+  'list_projects',
+  {
+    title: 'List projects',
+    description: 'List the dashboard projects (id, name, tag). Use this first; ids are needed for update_project and delete_project.',
+    inputSchema: {},
+  },
+  async () => {
+    try {
+      const { projects } = await getJSON('/api/projects');
+      if (!projects?.length) return ok('No projects.');
+      return ok((projects as any[]).map((p) => `• ${p.id} — ${p.name}${p.tag ? '  #' + p.tag : ''}`).join('\n'));
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+// ── create_project ───────────────────────────────────────────────────────────
+server.registerTool(
+  'create_project',
+  {
+    title: 'Create project',
+    description: 'Add a new project. name is required; tag (without #) is what links vault tasks to it; color is an optional hex value.',
+    inputSchema: {
+      name: z.string().describe('Display name, e.g. "OBD2 CAN Reader".'),
+      tag: z.string().optional().describe('Vault hashtag without the # (defaults from the name).'),
+      color: z.string().optional().describe('Hex color, e.g. #2dd4bf.'),
+    },
+  },
+  async ({ name, tag, color }) => {
+    try {
+      const { project } = await postJSON('/api/projects', { name, tag, color });
+      return ok(`Created project ${project.id} — ${project.name}${project.tag ? '  #' + project.tag : ''}`);
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+// ── update_project ───────────────────────────────────────────────────────────
+server.registerTool(
+  'update_project',
+  {
+    title: 'Update project',
+    description: 'Edit a project. Pass its id (from list_projects) plus only the fields to change. The id stays stable even if the tag changes.',
+    inputSchema: {
+      id: z.string().describe('Project id from list_projects.'),
+      name: z.string().optional(),
+      tag: z.string().optional().describe('Vault hashtag without the #.'),
+      color: z.string().optional().describe('Hex color.'),
+    },
+  },
+  async ({ id, ...patch }) => {
+    try {
+      const { project } = await putJSON(`/api/projects/${encodeURIComponent(id)}`, patch);
+      return ok(`Updated project ${project.id} — ${project.name}${project.tag ? '  #' + project.tag : ''}`);
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+// ── delete_project ───────────────────────────────────────────────────────────
+server.registerTool(
+  'delete_project',
+  {
+    title: 'Delete project',
+    description: "Remove a project by id (from list_projects). Its tasks are kept — they just lose the project label.",
+    inputSchema: { id: z.string().describe('Project id from list_projects.') },
+  },
+  async ({ id }) => {
+    try {
+      await delJSON(`/api/projects/${encodeURIComponent(id)}`);
+      return ok(`Deleted project ${id}. Its tasks were kept.`);
     } catch (e) {
       return fail(e);
     }

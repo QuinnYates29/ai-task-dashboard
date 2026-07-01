@@ -3,6 +3,7 @@ import cors from 'cors';
 import { config, obsidianBase } from './config.js';
 import * as obsidian from './obsidian.js';
 import { pullTasks, pullAllOpenTasks, toggleTask, createTask, editTask, deleteTask, completeTaskByQuery } from './tasks.js';
+import { getProjects, addProject, removeProject, updateProject } from './projects.js';
 import { ollamaUp, type Provider } from './router.js';
 import { openInObsidian } from './obsidian.js';
 import { extractTasks, routeChat, routeChatStream, ingestConversation } from './chat.js';
@@ -28,6 +29,27 @@ app.get('/api/health', async (_req, res) => {
     ollama: { reachable: ollama, chatModel: config.ollama.chatModel, embedModel: config.ollama.embedModel },
     claude: { configured: config.anthropic.enabled, model: config.anthropic.model },
   });
+});
+
+// ── projects: persistent project list ────────────────────────────────────────
+app.get('/api/projects', (_req, res) => {
+  try { res.json({ projects: getProjects() }); }
+  catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/projects', (req, res) => {
+  try { res.json({ project: addProject(req.body) }); }
+  catch (e: any) { res.status(400).json({ error: e.message }); }
+});
+
+app.put('/api/projects/:id', (req, res) => {
+  try { res.json({ project: updateProject(req.params.id, req.body) }); }
+  catch (e: any) { res.status(400).json({ error: e.message }); }
+});
+
+app.delete('/api/projects/:id', (req, res) => {
+  try { removeProject(req.params.id); res.json({ ok: true }); }
+  catch (e: any) { res.status(400).json({ error: e.message }); }
 });
 
 // ── tasks: proxy the vault through the hub ───────────────────────────────────
